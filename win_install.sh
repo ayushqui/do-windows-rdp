@@ -272,35 +272,75 @@ log_success "Batch script created with debug logs."
 
 # --- 6. WRITE IMAGE ---
 log_step "STEP 6: Writing OS to Disk"
+
 umount -f /dev/vda* 2>/dev/null
+
+log_info "Starting image write... THIS WILL TAKE TIME"
+
 if echo "$PILIHOS" | grep -qiE '\.gz($|\?)'; then
   wget --no-check-certificate -O- "$PILIHOS" | gunzip | dd of=/dev/vda bs=4M status=progress
 else
   wget --no-check-certificate -O- "$PILIHOS" | dd of=/dev/vda bs=4M status=progress
 fi
+
 sync
 sleep 3
 
+log_success "Disk write complete."
+
+# 🔥 IMPORTANT: Force kernel to reload partitions
+log_step "Reloading partition table..."
+
+partprobe /dev/vda
+sleep 2
+blockdev --rereadpt /dev/vda 2>/dev/null
+sleep 2
+udevadm settle
+
+log_info "Current disk layout:"
+lsblk
+
 # --- 7. PARTITION & MOUNT ---
 log_step "STEP 7: Mounting Windows Partition"
-partprobe /dev/vda
-sleep 5
 
-target=""
-for i in {1..10}; do
-    if [ -b /dev/vda2 ]; then target="/dev/vda2"; break; fi
-    if [ -b /dev/vda1 ]; then target="/dev/vda1"; break; fi
-    echo "   Searching for partition... ($i/10)"
-    sleep 2
-    partprobe /dev/vda
-done
-[ -z "$target" ] && { log_error "Partition not found."; exit 1; }
+# 🔥 Auto-detect FIRST valid partition (works for all layouts)
+target=$(lsblk -ln -o NAME,TYPE | awk '$2=="part"{print "/dev/"$1; exit}')
 
-log_info "Partition Found: $target. Fixing NTFS..."
+if [ -z "$target" ]; then
+    log_error "No partition found after imaging!"
+    lsblk
+    exit 1
+fi
+
+log_success "Partition detected: $target"
+
+# 🔥 Create mount directory safely
+mkdir -p /mnt/windows
+
+if [ ! -d /mnt/windows ]; then
+    log_error "Failed to create mount directory!"
+    exit 1
+fi
+
+# 🔥 Verify device exists
+if [ ! -b "$target" ]; then
+    log_error "Target device does not exist!"
+    exit 1
+fi
+
+log_info "Fixing NTFS filesystem..."
 ntfsfix -d "$target" > /dev/null 2>&1
 
-mkdir -p /mnt/windows
-mount.ntfs-3g -o remove_hiberfile,rw "$target" /mnt/windows || mount.ntfs-3g -o force,rw "$target" /mnt/windows
+log_info "Mounting partition..."
+mount.ntfs-3g "$target" /mnt/windows || {
+    log_error "Mount failed!"
+    echo "==== DEBUG INFO ===="
+    lsblk
+    dmesg | tail -20
+    exit 1
+}
+
+log_success "Partition mounted successfully!"
 
 # --- 8. INJECT FILES ---
 log_step "STEP 8: Injecting Setup Files"
